@@ -759,16 +759,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 		h.ResponseEnded = true
 
 		// 立即发送 message_stop（与 Python 版本保持一致，不等待 Finish()）
-		outputTokens := h.OutputDeltaCount
-		if outputTokens < 1 {
-			fullText := strings.Join(h.ResponseBuffer, "")
-			fullToolInput := strings.Join(h.AllToolInputs, "")
-			outputTokens = tokenizer.CountTokens(fullText + fullToolInput)
-			if outputTokens < 1 {
-				outputTokens = 1
-			}
-		}
-		events = append(events, BuildMessageStop(h.InputTokens, outputTokens, h.stopReason()))
+		events = append(events, BuildMessageStop(h.InputTokens, h.OutputTokens(), h.stopReason()))
 
 	case "meteringEvent":
 		// 提取 credit usage
@@ -978,20 +969,7 @@ func (h *ClaudeStreamHandler) Finish() string {
 		h.ContentBlockStopSent = true
 	}
 
-	// 使用流式 delta 计数作为输出 token 数
-	// 根据 anthropic-tokenizer 项目，每个流式事件对应一个 token，这是最准确的计数方式
-	outputTokens := h.OutputDeltaCount
-	if outputTokens < 1 {
-		// 如果没有 delta 事件，回退到文本估算（使用 Claude tokenizer）
-		fullText := strings.Join(h.ResponseBuffer, "")
-		fullToolInput := strings.Join(h.AllToolInputs, "")
-		outputTokens = tokenizer.CountTokens(fullText + fullToolInput)
-		if outputTokens < 1 {
-			outputTokens = 1
-		}
-	}
-
-	result += BuildMessageStop(h.InputTokens, outputTokens, h.stopReason())
+	result += BuildMessageStop(h.InputTokens, h.OutputTokens(), h.stopReason())
 	return result
 }
 
@@ -1003,19 +981,18 @@ func (h *ClaudeStreamHandler) stopReason() string {
 }
 
 // OutputTokens 返回基于流式事件的输出 token 数
+// 文本部分通过 OutputDeltaCount 在 assistantResponseEvent 中累计；
+// tool_use 输入不进入 OutputDeltaCount，这里额外按 AllToolInputs 估算并相加，
+// 避免混合（文本+tool_use）或纯 tool_use 响应被低估甚至记为 0。
 // @author ygw
 func (h *ClaudeStreamHandler) OutputTokens() int {
-	var tokens int
-	if h.OutputDeltaCount > 0 {
-		tokens = h.OutputDeltaCount
-	} else {
-		// 回退到文本估算（使用 Claude tokenizer）
-		fullText := strings.Join(h.ResponseBuffer, "")
-		fullToolInput := strings.Join(h.AllToolInputs, "")
-		tokens = tokenizer.CountTokens(fullText + fullToolInput)
-		if tokens < 1 {
-			tokens = 1
-		}
+	tokens := h.OutputDeltaCount
+	if fullToolInput := strings.Join(h.AllToolInputs, ""); fullToolInput != "" {
+		tokens += tokenizer.CountTokens(fullToolInput)
+	}
+	if tokens < 1 {
+		// 兜底：完全无内容（极端 EOF/取消）也至少计 1 token
+		tokens = 1
 	}
 	return tokens
 }

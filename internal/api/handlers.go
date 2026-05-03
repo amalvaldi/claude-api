@@ -2901,6 +2901,7 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 
 	// 按顺序添加工具调用
 	var toolCalls []map[string]interface{}
+	var allToolInputs strings.Builder
 	for _, toolUseID := range toolUseOrder {
 		tracker := toolUseMap[toolUseID]
 		// 合并所有输入片段
@@ -2908,6 +2909,7 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		for _, s := range tracker.InputBuffer {
 			fullInputStr += s
 		}
+		allToolInputs.WriteString(fullInputStr)
 
 		// 解析 JSON 输入
 		var toolInput map[string]interface{}
@@ -2943,9 +2945,11 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		stopReason = "tool_use"
 	}
 
-	// 非流式响应无法使用 delta 计数，使用 tiktoken 估算
-	// 注意：tiktoken 使用 OpenAI 的 cl100k_base 编码，与 Claude 的 tokenizer 存在差异
-	outputTokens := estimateTokens(fullContent)
+	// 输出 token：文本 + 工具输入（与流式 OutputTokens 保持一致），纯 tool_use 也能正确计数
+	outputTokens := tokenizer.CountTokens(fullContent + allToolInputs.String())
+	if outputTokens < 1 {
+		outputTokens = 1
+	}
 
 	response := map[string]interface{}{
 		"id":              conversationID,
@@ -3374,9 +3378,20 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 使用传入的 inputTokens，输出 token 使用 tokenizer 计算（基于剥离前的内容，含 thinking）
+	// 输出 token：文本 + 工具调用 arguments（避免纯 tool_use 响应被记为 0）
 	promptTokens := inputTokens
-	completionTokens := tokenizer.CountTokens(fullContent)
+	var toolArgsBuf strings.Builder
+	for _, tc := range toolCalls {
+		if fn, ok := tc["function"].(map[string]interface{}); ok {
+			if args, ok := fn["arguments"].(string); ok {
+				toolArgsBuf.WriteString(args)
+			}
+		}
+	}
+	completionTokens := tokenizer.CountTokens(fullContent + toolArgsBuf.String())
+	if completionTokens < 1 {
+		completionTokens = 1
+	}
 
 	// OpenAI Chat 协议没有 thinking 块概念：剥离 <thinking>...</thinking>\n\n 后再返回
 	visibleContent := stream.StripThinkingTags(fullContent)
@@ -3836,8 +3851,18 @@ func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Res
 		}
 	}
 
+	// 输出 token：文本 + 工具调用 arguments（避免纯 tool_use 响应被记为 0）
 	promptTokens := inputTokens
-	completionTokens := tokenizer.CountTokens(fullContent)
+	var toolArgsBuf strings.Builder
+	for _, tc := range toolCalls {
+		if args, ok := tc["arguments"].(string); ok {
+			toolArgsBuf.WriteString(args)
+		}
+	}
+	completionTokens := tokenizer.CountTokens(fullContent + toolArgsBuf.String())
+	if completionTokens < 1 {
+		completionTokens = 1
+	}
 
 	// 构建 output 数组
 	messageID := "msg_" + responseID[5:]
