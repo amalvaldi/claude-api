@@ -67,7 +67,30 @@ type Server struct {
 
 	// Prompt 缓存追踪器（本地模拟 cache token 计算）
 	promptCache *cache.PromptCache
+
+	// expired 账号自愈：每个账号的失败计数 + 锁定时间（重启清零）
+	// 累计失败到 expiredRecoverMaxFailures 后锁定 expiredRecoverLockoutDur，期满后重置计数再试
+	expiredRefreshFailures sync.Map // key: accountID(string), value: *expiredRecoverState
 }
+
+// expiredRecoverState expired 账号自愈状态
+//   - fails: 当前周期内的失败次数，每次锁定结束后重置为 0
+//   - totalFails: 累计失败次数（跨周期不重置），用于永久禁用判定
+//   - lockUntil: 锁定截止时间，零值表示未锁定
+type expiredRecoverState struct {
+	fails      int
+	totalFails int
+	lockUntil  time.Time
+}
+
+// expired 账号后台自愈任务的常量
+const (
+	expiredRecoverInterval       = 10 * time.Minute // 扫描周期
+	expiredRecoverInitialWait    = 30 * time.Second // 启动后首次扫描的延迟，避免冷启动抢资源
+	expiredRecoverMaxFailures    = 5                // 同账号连续刷新失败上限，到达后锁定
+	expiredRecoverLockoutDur     = 1 * time.Hour    // 锁定时长，期满重置计数再试
+	expiredRecoverPermanentLimit = 99               // 累计失败上限，达到则永久禁用账号
+)
 
 // suspendedCacheEntry 账号封控状态缓存条目
 // @author ygw
@@ -227,7 +250,143 @@ func (s *Server) StartCaches(ctx context.Context) {
 	s.accountPool.Start(ctx)
 	// 启动设置缓存后台刷新
 	s.settingsCache.Start(ctx)
-	logger.Info("缓存系统已启动 - 账号池刷新间隔: 10s, 设置缓存TTL: 30s")
+	// 启动 expired 账号后台自愈任务
+	go s.backgroundExpiredAccountRecover(ctx)
+	logger.Info("缓存系统已启动 - 账号池刷新间隔: 10s, 设置缓存TTL: 30s, expired 自愈周期: %v",
+		expiredRecoverInterval)
+}
+
+// backgroundExpiredAccountRecover 后台周期性扫 status=expired 账号尝试 token 刷新自愈
+// 单账号连续 expiredRecoverMaxFailures 次失败 → status 改 disabled 不再重试，避免一直打 OIDC
+// @author ygw
+func (s *Server) backgroundExpiredAccountRecover(ctx context.Context) {
+	// 启动后等一会儿再开扫，避免冷启动期间 OIDC 流量集中
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(expiredRecoverInitialWait):
+	}
+
+	ticker := time.NewTicker(expiredRecoverInterval)
+	defer ticker.Stop()
+
+	// 启动后立即跑一次（已等过 initialWait）
+	s.recoverExpiredAccounts(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.recoverExpiredAccounts(ctx)
+		}
+	}
+}
+
+// recoverExpiredAccounts 扫描所有 expired 账号，尝试刷新 token
+// 失败计数 ≥ 上限 → 锁定 1 小时；锁定期内跳过；锁定期满 → 重置计数再试
+// @author ygw
+func (s *Server) recoverExpiredAccounts(ctx context.Context) {
+	accounts, err := s.db.ListAccountsByStatus(ctx, models.AccountStatusExpired, "updated_at", false)
+	if err != nil {
+		// DB 查询失败：不知道当前 expired 集合，跳过本轮（含孤儿清理），下轮重试
+		logger.Warn("[expired 自愈] 列出 expired 账号失败: %v", err)
+		return
+	}
+	// 注意：不能在 len(accounts)==0 时早返回，否则孤儿清理跳过 → 内存中残留的 state 永远清不掉
+
+	now := time.Now()
+	var recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled int
+
+	for _, acc := range accounts {
+		// 取出当前账号的自愈状态
+		var state *expiredRecoverState
+		if v, ok := s.expiredRefreshFailures.Load(acc.ID); ok {
+			state = v.(*expiredRecoverState)
+		} else {
+			state = &expiredRecoverState{}
+		}
+
+		// 累计失败已达永久禁用阈值：直接 disable，停止后续重试
+		if state.totalFails >= expiredRecoverPermanentLimit {
+			reason := fmt.Sprintf("token 累计 %d 次刷新失败，已永久禁用，需人工排查", state.totalFails)
+			if err := s.db.UpdateAccountStatus(ctx, acc.ID, models.AccountStatusDisabled, reason); err != nil {
+				logger.Warn("[expired 自愈] 标记账号 %s 为永久禁用失败: %v", acc.ID, err)
+				continue
+			}
+			s.expiredRefreshFailures.Delete(acc.ID)
+			logger.Warn("[expired 自愈] 账号 %s 已永久禁用 - %s", acc.ID, reason)
+			permanentlyDisabled++
+			continue
+		}
+
+		// 锁定期处理：使用 Before（严格 <）和 !Before（即 >=），完整覆盖边界
+		if !state.lockUntil.IsZero() {
+			if now.Before(state.lockUntil) {
+				// 仍在锁定期内：跳过
+				lockedSkipped++
+				continue
+			}
+			// 锁定期已满（now >= lockUntil）：重置周期计数，给一次新机会（totalFails 保留累计）
+			state.fails = 0
+			state.lockUntil = time.Time{}
+		}
+
+		// 周期失败次数已达上限：进入锁定，本轮不再尝试刷新
+		if state.fails >= expiredRecoverMaxFailures {
+			state.lockUntil = now.Add(expiredRecoverLockoutDur)
+			s.expiredRefreshFailures.Store(acc.ID, state)
+			logger.Warn("[expired 自愈] 账号 %s 连续 %d 次刷新失败，锁定 %v 后再试 (累计 %d/%d)",
+				acc.ID, expiredRecoverMaxFailures, expiredRecoverLockoutDur,
+				state.totalFails, expiredRecoverPermanentLimit)
+			locked++
+			continue
+		}
+
+		// 尝试刷新（refreshAccountToken 内部走 singleflight，并在失败时调 UpdateStats）
+		if err := s.refreshAccountToken(ctx, acc.ID); err != nil {
+			state.fails++
+			state.totalFails++
+			s.expiredRefreshFailures.Store(acc.ID, state)
+			logger.Debug("[expired 自愈] 账号 %s 刷新失败 (周期 %d/%d, 累计 %d/%d): %v",
+				acc.ID, state.fails, expiredRecoverMaxFailures,
+				state.totalFails, expiredRecoverPermanentLimit, err)
+			failedThisRound++
+			continue
+		}
+
+		// 刷新成功：UpdateTokens 已自动把 status 恢复为 normal、enabled=true
+		s.expiredRefreshFailures.Delete(acc.ID)
+		recovered++
+		logger.Info("[expired 自愈] 账号 %s token 已恢复，状态回归 normal", acc.ID)
+	}
+
+	if recovered+failedThisRound+locked+lockedSkipped+permanentlyDisabled > 0 {
+		logger.Info("[expired 自愈] 本轮 %d 个账号 - 恢复: %d, 刷新失败: %d, 进入锁定: %d, 锁定中跳过: %d, 永久禁用: %d",
+			len(accounts), recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled)
+	}
+
+	// 孤儿状态清理：本轮 expired 列表里不存在的账号，把 state 从内存里删掉
+	// 覆盖：管理员手动改 status、账号被删除、其他路径恢复账号 等场景
+	expiredIDs := make(map[string]struct{}, len(accounts))
+	for _, acc := range accounts {
+		expiredIDs[acc.ID] = struct{}{}
+	}
+	var orphansCleaned int
+	s.expiredRefreshFailures.Range(func(key, _ interface{}) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, stillExpired := expiredIDs[id]; !stillExpired {
+			s.expiredRefreshFailures.Delete(id)
+			orphansCleaned++
+		}
+		return true
+	})
+	if orphansCleaned > 0 {
+		logger.Debug("[expired 自愈] 清理 %d 个不再属于 expired 状态的孤儿计数", orphansCleaned)
+	}
 }
 
 // InvalidateAccountCache 使账号缓存失效（账号变更时调用）
