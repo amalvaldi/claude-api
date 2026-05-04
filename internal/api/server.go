@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -90,6 +91,8 @@ const (
 	expiredRecoverMaxFailures    = 5                // 同账号连续刷新失败上限，到达后锁定
 	expiredRecoverLockoutDur     = 1 * time.Hour    // 锁定时长，期满重置计数再试
 	expiredRecoverPermanentLimit = 99               // 累计失败上限，达到则永久禁用账号
+	expiredRecoverPaceBase       = 5 * time.Second  // 相邻刷新请求之间的基础间隔，避免 OIDC 集中限流
+	expiredRecoverPaceJitter     = 2 * time.Second  // 间隔抖动幅度（实际间隔 = base ± jitter/2）
 )
 
 // suspendedCacheEntry 账号封控状态缓存条目
@@ -300,6 +303,8 @@ func (s *Server) recoverExpiredAccounts(ctx context.Context) {
 	now := time.Now()
 	nowUnix := now.Unix()
 	var recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled, outOfValidity int
+	// 是否已经发起过 refresh：用于在相邻 refresh 之间插入抖动间隔，错开 OIDC 请求避免 429
+	refreshAttempted := false
 
 	for _, acc := range accounts {
 		// 跳过已过 TokenExpiry 有效期的账号：订阅/试用期都过了，刷 token 也救不回来
@@ -353,6 +358,18 @@ func (s *Server) recoverExpiredAccounts(ctx context.Context) {
 			locked++
 			continue
 		}
+
+		// 在两次刷新之间插入带抖动的间隔，避免短时间内集中打 OIDC 触发 429
+		if refreshAttempted {
+			pace := expiredRecoverPaceBase - expiredRecoverPaceJitter/2 +
+				time.Duration(rand.Int63n(int64(expiredRecoverPaceJitter)))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pace):
+			}
+		}
+		refreshAttempted = true
 
 		// 尝试刷新（refreshAccountToken 内部走 singleflight，并在失败时调 UpdateStats）
 		if err := s.refreshAccountToken(ctx, acc.ID); err != nil {
