@@ -238,6 +238,9 @@ type Client struct {
 	cfg           *config.Config
 	proxyPool     *proxypool.ProxyPool // 代理池
 	baseTransport *http.Transport      // 基础 Transport（无代理配置）
+	// 代理 HTTP Client 缓存：key = 派生后的代理 URL（含账号 session），value = *http.Client
+	// 让连接池真正生效——之前每次请求都 Clone transport 新建 client，连接复用率为 0
+	proxyClients sync.Map
 }
 
 // NewClient 创建新的 Amazon Q 客户端
@@ -245,9 +248,9 @@ type Client struct {
 // @author ygw - 高并发优化
 const (
 	// DefaultMaxIdleConns 默认最大空闲连接数（支持高并发）
-	DefaultMaxIdleConns = 200
+	DefaultMaxIdleConns = 600
 	// DefaultMaxIdleConnsPerHost 每个主机的最大空闲连接数
-	DefaultMaxIdleConnsPerHost = 100
+	DefaultMaxIdleConnsPerHost = 200
 	// DefaultIdleConnTimeout 空闲连接超时时间
 	DefaultIdleConnTimeout = 120 * time.Second
 	// DefaultResponseHeaderTimeout 响应头超时时间
@@ -679,6 +682,7 @@ func (c *Client) SetProxyPool(pool *proxypool.ProxyPool) {
 
 // GetHTTPClientForAccount 获取账号专用的 HTTP 客户端
 // 如果启用了代理池，会根据账号 ID 派生代理地址
+// 同一派生 URL 的 client 会被缓存（含连接池），避免每请求都新建 transport 导致连接复用率为 0
 // @param accountID 账号ID，用于 Session 派生
 // @return *http.Client 配置了代理的 HTTP 客户端
 // @author ygw
@@ -695,7 +699,12 @@ func (c *Client) GetHTTPClientForAccount(accountID string) *http.Client {
 		return c.httpClient
 	}
 
-	// 创建带代理的 Transport
+	// 命中缓存：直接复用，连接池保留
+	if cached, ok := c.proxyClients.Load(proxyURL); ok {
+		return cached.(*http.Client)
+	}
+
+	// 缓存未命中，构造新 client（每个 proxyURL 一份，常驻复用）
 	transport := c.baseTransport.Clone()
 	parsedURL, err := url.Parse(proxyURL)
 	if err != nil {
@@ -718,10 +727,37 @@ func (c *Client) GetHTTPClientForAccount(accountID string) *http.Client {
 		transport.Proxy = http.ProxyURL(parsedURL)
 	}
 
-	logger.Debug("账号 %s 使用代理: %s", accountID, proxyURL)
-
-	return &http.Client{
+	newClient := &http.Client{
 		Transport: transport,
 		Timeout:   300 * time.Second,
+	}
+
+	// 并发安全：如果其他 goroutine 同时为同一 URL 建了 client，弃掉自己刚建的，复用先到的
+	if actual, loaded := c.proxyClients.LoadOrStore(proxyURL, newClient); loaded {
+		return actual.(*http.Client)
+	}
+
+	logger.Debug("账号 %s 新建代理 client 并加入缓存: %s", accountID, proxyURL)
+	return newClient
+}
+
+// InvalidateProxyClients 代理池配置变更时调用，清空 client 缓存避免使用过期代理
+// 同时主动关闭旧 transport 的 idle 连接，立即释放 fd（不等 IdleConnTimeout 自然超时）
+// 注意：CloseIdleConnections 只关 idle 不关在飞请求，正在跑的请求安全退出
+// @author ygw
+func (c *Client) InvalidateProxyClients() {
+	count := 0
+	c.proxyClients.Range(func(key, value interface{}) bool {
+		if client, ok := value.(*http.Client); ok {
+			if transport, ok := client.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+		}
+		c.proxyClients.Delete(key)
+		count++
+		return true
+	})
+	if count > 0 {
+		logger.Info("代理 client 缓存已清空 (%d 条)", count)
 	}
 }

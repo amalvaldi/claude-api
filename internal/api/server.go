@@ -240,6 +240,7 @@ func (s *Server) reloadProxyPool() {
 	s.proxyPool.Reload(proxies)
 	s.proxyPool.SetStrategy(s.cfg.ProxyPoolStrategy)
 	s.aqClient.SetProxyPool(s.proxyPool)
+	s.aqClient.InvalidateProxyClients() // 代理列表已变，缓存的 client 可能指向已删除的代理
 	logger.Info("代理池已加载，共 %d 个代理，策略: %s", len(proxies), s.cfg.ProxyPoolStrategy)
 }
 
