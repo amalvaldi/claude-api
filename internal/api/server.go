@@ -227,6 +227,7 @@ func (s *Server) reloadProxyPool() {
 	if !s.cfg.ProxyPoolEnabled {
 		s.proxyPool = nil
 		s.aqClient.SetProxyPool(nil)
+		s.aqClient.InvalidateProxyClients() // 关代理池时也清缓存，释放旧 idle 连接
 		return
 	}
 	proxies, err := s.db.GetProxies(context.Background())
