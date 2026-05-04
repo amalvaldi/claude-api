@@ -10,16 +10,25 @@ import (
 )
 
 const (
-	errDumpDir     = "logs/error_dumps"
-	maxErrDumpFiles = 20
+	errDumpDir       = "logs/error_dumps"
+	maxErrDumpFiles  = 20
+	maxDumpBodySize  = 3 * 1024 * 1024 // 3MB：超过此阈值的 body 不全量转 string，避免错误诊断时把内存吃爆
 )
 
 // DumpInvalidRequest 保存 INVALID_REQUEST 错误的完整诊断信息
-// clientBody: 客户端原始请求体
+// clientBody: 客户端原始请求体（[]byte，避免调用方在 hot path 上做 string 拷贝；>3MB 时本函数内部截断）
 // convertedBody: 转换后发送给上游的请求体
 // upstreamResp: 上游返回的响应体
-func DumpInvalidRequest(clientBody, convertedBody, upstreamResp string) {
-	go doDump(clientBody, convertedBody, upstreamResp)
+func DumpInvalidRequest(clientBody []byte, convertedBody, upstreamResp string) {
+	var bodyStr string
+	if len(clientBody) <= maxDumpBodySize {
+		bodyStr = string(clientBody)
+	} else {
+		// 大 body 截断：保留前 3MB 用于诊断，避免一次性分配几十 MB 的 string
+		bodyStr = fmt.Sprintf("[body 过大已截断: 总 %d bytes，仅保留前 %d bytes]\n%s",
+			len(clientBody), maxDumpBodySize, string(clientBody[:maxDumpBodySize]))
+	}
+	go doDump(bodyStr, convertedBody, upstreamResp)
 }
 
 func doDump(clientBody, convertedBody, upstreamResp string) {

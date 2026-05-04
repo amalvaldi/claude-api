@@ -2149,9 +2149,6 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 	// 保存接收到的请求到 in.log（仅调试模式）
 	saveInLog(body, logTimestamp)
 
-	// 保存原始请求体，用于错误诊断转储
-	c.Set("raw_request_body", string(body))
-
 	// 解析请求
 	var req models.ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -2525,9 +2522,8 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 					if nrErr.IsRequestErr {
 						// 转储 INVALID_REQUEST 错误的完整诊断信息
 						if nrErr.Code == "INVALID_REQUEST" {
-							rawBody, _ := c.Get("raw_request_body")
-							rawBodyStr, _ := rawBody.(string)
-							logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+							// 直接传 []byte，>3MB body 由 DumpInvalidRequest 内部截断，避免大请求触发巨型 string 分配
+							logger.DumpInvalidRequest(body, string(aqPayloadJSON), nrErr.UpstreamBody)
 						}
 
 						// 模型不可用：打印请求模型和上游响应，便于定位
@@ -3010,9 +3006,6 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	c.Set("log_timestamp", logTimestamp)
 	saveInLog(body, logTimestamp)
 
-	// 保存原始请求体，用于错误诊断转储
-	c.Set("raw_request_body", string(body))
-
 	// 解析请求
 	var req models.ChatCompletionRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -3161,9 +3154,8 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 			if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
 				// 转储 INVALID_REQUEST 错误的完整诊断信息
 				if nrErr.Code == "INVALID_REQUEST" {
-					rawBody, _ := c.Get("raw_request_body")
-					rawBodyStr, _ := rawBody.(string)
-					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+					// 直接传 []byte，>3MB body 由 DumpInvalidRequest 内部截断，避免大请求触发巨型 string 分配
+					logger.DumpInvalidRequest(body, string(aqPayloadJSON), nrErr.UpstreamBody)
 				}
 
 				// 模型不可用：打印请求模型和上游响应，便于定位
@@ -3475,7 +3467,6 @@ func (s *Server) handleResponses(c *gin.Context) {
 	logTimestamp := time.Now().Format("20060102_150405")
 	c.Set("log_timestamp", logTimestamp)
 	saveInLog(body, logTimestamp)
-	c.Set("raw_request_body", string(body))
 
 	var req models.ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -3637,9 +3628,8 @@ func (s *Server) handleResponses(c *gin.Context) {
 		if amazonq.IsNonRetriable(err) {
 			if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
 				if nrErr.Code == "INVALID_REQUEST" {
-					rawBody, _ := c.Get("raw_request_body")
-					rawBodyStr, _ := rawBody.(string)
-					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+					// 直接传 []byte，>3MB body 由 DumpInvalidRequest 内部截断，避免大请求触发巨型 string 分配
+					logger.DumpInvalidRequest(body, string(aqPayloadJSON), nrErr.UpstreamBody)
 				}
 
 				// 模型不可用：打印请求模型和上游响应，便于定位
