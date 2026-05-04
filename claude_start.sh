@@ -11,13 +11,15 @@ pkill -9 -f claude-api-watchdog 2>/dev/null
 
 # 等旧 app 真正退出（main.go 优雅关闭最多 30s），最多等 35s
 # 不等的话 sleep 1 后旧实例可能还在占端口，新实例启动失败
+# 用 pidof 而非 pgrep -f：watchdog 的 bash 命令行里也包含 "claude-api-linux" 字符串，
+# pgrep -f 会误把 watchdog 当 app 进程
 for i in $(seq 1 35); do
-    pgrep -f claude-api-linux > /dev/null 2>&1 || break
+    pidof claude-api-linux > /dev/null 2>&1 || break
     sleep 1
 done
 
 # 兜底：35s 还没退出说明 graceful shutdown 卡死了，强杀避免新实例端口冲突
-if pgrep -f claude-api-linux > /dev/null 2>&1; then
+if pidof claude-api-linux > /dev/null 2>&1; then
     pkill -9 -f claude-api-linux 2>/dev/null
     sleep 1
 fi
@@ -42,7 +44,9 @@ nohup bash -c "
     cd '$SCRIPT_DIR'
     while true; do
         sleep 10
-        if ! pgrep -f claude-api-linux > /dev/null 2>&1; then
+        # 必须用 pidof（按 /proc/<pid>/exe basename 匹配），不能用 pgrep -f：
+        # 本 watchdog 自身的 bash 命令行里也包含 \"claude-api-linux\" 字符串，pgrep -f 会误命中自己
+        if ! pidof claude-api-linux > /dev/null 2>&1; then
             echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] claude-api-linux 已停止，重新执行 claude_start.sh\" >> claude-watchdog.log
             exec bash '$SCRIPT_PATH'
         fi
