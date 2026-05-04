@@ -296,9 +296,18 @@ func (s *Server) recoverExpiredAccounts(ctx context.Context) {
 	// 注意：不能在 len(accounts)==0 时早返回，否则孤儿清理跳过 → 内存中残留的 state 永远清不掉
 
 	now := time.Now()
-	var recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled int
+	nowUnix := now.Unix()
+	var recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled, outOfValidity int
 
 	for _, acc := range accounts {
+		// 跳过已过 TokenExpiry 有效期的账号：订阅/试用期都过了，刷 token 也救不回来
+		// 顺手清掉可能存在的内存计数
+		if acc.TokenExpiry != nil && *acc.TokenExpiry > 0 && *acc.TokenExpiry <= nowUnix {
+			s.expiredRefreshFailures.Delete(acc.ID)
+			outOfValidity++
+			continue
+		}
+
 		// 取出当前账号的自愈状态
 		var state *expiredRecoverState
 		if v, ok := s.expiredRefreshFailures.Load(acc.ID); ok {
@@ -361,9 +370,9 @@ func (s *Server) recoverExpiredAccounts(ctx context.Context) {
 		logger.Info("[expired 自愈] 账号 %s token 已恢复，状态回归 normal", acc.ID)
 	}
 
-	if recovered+failedThisRound+locked+lockedSkipped+permanentlyDisabled > 0 {
-		logger.Info("[expired 自愈] 本轮 %d 个账号 - 恢复: %d, 刷新失败: %d, 进入锁定: %d, 锁定中跳过: %d, 永久禁用: %d",
-			len(accounts), recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled)
+	if recovered+failedThisRound+locked+lockedSkipped+permanentlyDisabled+outOfValidity > 0 {
+		logger.Info("[expired 自愈] 本轮 %d 个账号 - 恢复: %d, 刷新失败: %d, 进入锁定: %d, 锁定中跳过: %d, 永久禁用: %d, 已过有效期跳过: %d",
+			len(accounts), recovered, failedThisRound, locked, lockedSkipped, permanentlyDisabled, outOfValidity)
 	}
 
 	// 孤儿状态清理：本轮 expired 列表里不存在的账号，把 state 从内存里删掉
