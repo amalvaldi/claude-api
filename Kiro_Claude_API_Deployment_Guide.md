@@ -31,20 +31,25 @@ sed -i.bak 's/[archive.ubuntu.com/mirrors.kernel.org/g](https://archive.ubuntu.c
 # 清理缓存并更新列表
 apt clean
 apt update
-
 1.2 安装基础依赖
+Bash
 apt install -y git mysql-server curl wget
 (注：如果安装过程中弹出粉灰色界面提示 "Daemons using outdated libraries"，直接按 回车键 (Enter) 采用默认选项重启服务即可。)
 
 2. MySQL 数据库初始化
+本项目依赖 MySQL 存储 Kiro 账号池数据。
+
+Bash
 # 进入 MySQL 控制台 (直接回车)
 mysql -u root
 在 MySQL 终端中依次执行以下 SQL 语句（请自行修改 your_password 为你的数据库密码）：
+
+SQL
 -- 创建支持中文字符集的数据库
 CREATE DATABASE kiro_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 -- 创建专用数据库用户并设置密码
-CREATE USER 'kiro_user'@'localhost' IDENTIFIED BY 'Carrot0416.';
+CREATE USER 'kiro_user'@'localhost' IDENTIFIED BY 'your_password';
 
 -- 赋予该用户操作 kiro_db 的所有权限
 GRANT ALL PRIVILEGES ON kiro_db.* TO 'kiro_user'@'localhost';
@@ -52,16 +57,15 @@ GRANT ALL PRIVILEGES ON kiro_db.* TO 'kiro_user'@'localhost';
 -- 刷新权限并退出
 FLUSH PRIVILEGES;
 EXIT;
-
-
 3. 安装最新版 Go 语言环境
 注意：千万不要使用 apt install golang-go！
 该项目使用了较新的 Go 特性，要求 Go 版本 >= 1.24.0。Ubuntu 自带的 apt 源通常版本过老 (1.18)，会导致后续编译出现 invalid go version 错误。
 
 3.1 卸载旧版本（如有）
+Bash
 apt remove -y golang-go golang-1.18-go
-
 3.2 手动安装 Go (以 1.26.2 为例)
+Bash
 # 下载 Go 安装包
 wget [https://go.dev/dl/go1.26.2.linux-amd64.tar.gz](https://go.dev/dl/go1.26.2.linux-amd64.tar.gz)
 
@@ -74,18 +78,21 @@ export PATH=$PATH:/usr/local/go/bin
 # 验证安装是否成功
 go version
 (为保证下次登录依然有效，建议将 export PATH=$PATH:/usr/local/go/bin 添加到 ~/.bashrc 文件末尾。)
+
 4. 拉取项目与前端依赖修复
 该项目自带 Web 管理面板，如果直接编译会提示缺少静态文件。必须通过自带脚本下载前端依赖。
 
+4.1 克隆代码
+Bash
 cd ~
 git clone [https://github.com/zhangrenhua/claude-api.git](https://github.com/zhangrenhua/claude-api.git)
 cd claude-api
-
 4.2 修复缺失的前端目录 (核心排错)
 现象： 运行 ./download.sh 时提示 Failed to create the file... No such file or directory。
 原因： 下载脚本不会自动创建多级父目录。
 解决： 手动创建缺失的目录，并赋予脚本执行权限。
 
+Bash
 # 创建缺失的静态资源目录
 mkdir -p frontend/vendor/js frontend/vendor/css frontend/vendor/fonts
 
@@ -98,12 +105,13 @@ cp github-dark.min.css frontend/vendor/css/
 
 # 运行下载脚本
 ./download.sh
+(此时所有前端库应能成功下载至 100%。即使出现 curl: no URL specified! 也可以忽略，因为我们已经手动复制了那两个 CSS 文件。)
 
 5. 编译服务端程序
 执行官方提供的统一构建脚本：
 
+Bash
 ./build.sh
-
 ⚠️ 重点注意 Wails CLI 报错：
 如果在日志最后看到以下内容：
 
@@ -116,19 +124,20 @@ Wails 是用于打包桌面端客户端（Windows/Mac）的工具。我们仅需
 5.1 解压服务端程序
 将打包好的服务端程序解压到当前目录：
 
-
+Bash
 tar -xzf dist/server/claude-server-linux-amd64.tar.gz -C ./
+解压后，当前目录会出现一个名为 claude-server 的可执行文件。
 
 6. 配置与启动服务
 6.1 修改配置文件
 项目根目录下提供了一个 MySQL 专属的配置模板，我们需要基于它进行修改。
 
+Bash
 # 复制模板文件
 cp config-mysql-example.yaml config.yaml
 
 # 编辑配置文件
 nano config.yaml
-
 在文件中找到 database / mysql 相关配置段，修改为你第 2 步设置的信息：
 
 dbname: kiro_db
@@ -139,9 +148,10 @@ password: your_password
 
 保存并退出 (Ctrl+O -> Enter -> Ctrl+X)。
 
+6.2 启动服务
+赋予可执行权限，并使用启动脚本运行：
+
+Bash
 chmod +x claude-server
 ./claude_start.sh
-
-
-
-
+启动成功后，即可通过浏览器访问 http://<你的服务器IP>:端口 (端口见 config.yaml 配置，默认通常为 8080 左右) 进入 Kiro 账号池管理后台。
